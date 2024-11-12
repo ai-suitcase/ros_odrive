@@ -10,6 +10,7 @@
 #include "std_srvs/srv/empty.hpp"
 #include "socket_can.hpp"
 
+#include "arbitrary_parameter.hpp"
 #include <mutex>
 #include <condition_variable>
 #include <array>
@@ -41,7 +42,15 @@ private:
     void request_clear_errors_callback();
     void ctrl_msg_callback();
     inline bool verify_length(const std::string&name, uint8_t expected, uint8_t length);
-    
+
+    void set_vel_gains();
+    bool is_gain_correct();
+
+    template <typename T>
+      void get_arbitrary_parameter(uint16_t endpoint_id, T &output_val);
+    template <typename T>
+      void set_arbitrary_parameter(uint16_t endpoint_id, T val);
+
     uint16_t node_id_;
     bool axis_idle_on_shutdown_;
     SocketCanIntf can_intf_ = SocketCanIntf();
@@ -69,6 +78,15 @@ private:
 
     EpollEvent srv_clear_errors_evt_;
     rclcpp::Service<Empty>::SharedPtr service_clear_errors_;
+
+    float vel_gain_;
+    float vel_integrator_gain_;
+    std::shared_ptr<rclcpp::ParameterEventHandler> vel_gain_subscriber_;
+    std::shared_ptr<rclcpp::ParameterCallbackHandle> vel_gain_cb_handle_;
+    std::shared_ptr<rclcpp::ParameterEventHandler> vel_integrator_gain_subscriber_;
+    std::shared_ptr<rclcpp::ParameterCallbackHandle> vel_integrator_gain_cb_handle_;
+
+    ArbitraryParameter params_;
 
 };
 

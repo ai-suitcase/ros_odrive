@@ -5,9 +5,14 @@
 #include <sys/eventfd.h>
 #include <chrono>
 
+const double VEL_GAIN_DEFAULT            = 0.16;
+const double VEL_INTEGRATOR_GAIN_DEFAULT = 0.33;
+
 enum CmdId : uint32_t {
     kHeartbeat = 0x001,            // ControllerStatus  - publisher
     kGetError = 0x003,             // SystemStatus      - publisher
+    kRxSdo,
+    kTxSdo,
     kSetAxisState = 0x007,         // SetAxisState      - service
     kGetEncoderEstimates = 0x009,  // ControllerStatus  - publisher
     kSetControllerMode = 0x00b,    // ControlMessage    - subscriber
@@ -18,6 +23,7 @@ enum CmdId : uint32_t {
     kGetTemp,                      // SystemStatus      - publisher
     kGetBusVoltageCurrent = 0x017, // SystemStatus      - publisher
     kClearErrors = 0x018,          // ClearErrors       - service
+    kSetVelGains = 0x01b,
     kGetTorques = 0x01c,           // ControllerStatus  - publisher
 };
 
@@ -28,11 +34,64 @@ enum ControlMode : uint64_t {
     kPositionControl,
 };
 
+enum NodeId : uint32_t {
+    kMotorLeft  = 0x00,
+    kMotorRight = 0x01,
+};
+
+enum OpcodeId : uint8_t {
+    kRead  = 0x00,
+    kWrite = 0x01,
+};
+
 ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_name) {
     
     rclcpp::Node::declare_parameter<std::string>("interface", "can0");
     rclcpp::Node::declare_parameter<uint16_t>("node_id", 0);
     rclcpp::Node::declare_parameter<bool>("axis_idle_on_shutdown", false);
+    rclcpp::Node::declare_parameter<std::string>("json_file_path", "PATH_TO_SHARE/PACKAGE/FIRMWARE_VERSION/flat_endpoints.json");
+
+    // get endpoint id
+    std::string json_file_path = rclcpp::Node::get_parameter("json_file_path").as_string();
+    params_.init(json_file_path);
+
+    // initiate parameter callback of "vel_gain"
+    std::string vel_gain_param_name = "vel_gain";
+    rclcpp::Node::declare_parameter<double>(vel_gain_param_name, VEL_GAIN_DEFAULT);
+    vel_gain_subscriber_ = std::make_shared<rclcpp::ParameterEventHandler>(this);
+    std::function<void(const rclcpp::Parameter&)> vel_gain_cb = 
+        [this](const rclcpp::Parameter & p) {
+            double vel_gain = p.as_double();
+            this->vel_gain_ = vel_gain;
+            while(rclcpp::ok()) {
+                this->set_vel_gains();
+                if(this->is_gain_correct()) break;
+            }
+        };
+    vel_gain_cb_handle_ =
+        vel_gain_subscriber_->add_parameter_callback(
+                vel_gain_param_name,
+                vel_gain_cb
+                );
+
+    // initiate parameter callback of "vel_integrator_gain"
+    std::string vel_integrator_gain_param_name = "vel_integrator_gain";
+    rclcpp::Node::declare_parameter<double>(vel_integrator_gain_param_name, VEL_INTEGRATOR_GAIN_DEFAULT);
+    vel_integrator_gain_subscriber_ = std::make_shared<rclcpp::ParameterEventHandler>(this);
+    std::function<void(const rclcpp::Parameter&)> vel_integrator_gain_cb =
+        [this](const rclcpp::Parameter & p) {
+            double vel_integrator_gain = p.as_double();
+            this->vel_integrator_gain_ = vel_integrator_gain;
+            while(true) {
+                this->set_vel_gains();
+                if(this->is_gain_correct()) break;
+            }
+        };
+    vel_integrator_gain_cb_handle_ =
+        vel_integrator_gain_subscriber_->add_parameter_callback(
+                vel_integrator_gain_param_name,
+                vel_integrator_gain_cb
+                );
 
     rclcpp::QoS ctrl_stat_qos(rclcpp::KeepAll{});
     ctrl_publisher_ = rclcpp::Node::create_publisher<ControllerStatus>("controller_status", ctrl_stat_qos);
@@ -100,6 +159,17 @@ bool ODriveCanNode::init(EpollEventLoop* event_loop) {
     return true;
 }
 
+void ODriveCanNode::set_vel_gains() {
+    struct can_frame frame;
+    frame.can_id = node_id_ << 5 | CmdId::kSetVelGains;
+    {
+        write_le<float>(vel_gain_,            frame.data + 0);
+        write_le<float>(vel_integrator_gain_, frame.data + 4);
+    }
+    frame.can_dlc = 8;
+    can_intf_.send_can_frame(frame);
+}
+
 void ODriveCanNode::recv_callback(const can_frame& frame) {
 
     if(((frame.can_id >> 5) & 0x3F) != node_id_) return;
@@ -114,6 +184,64 @@ void ODriveCanNode::recv_callback(const can_frame& frame) {
             ctrl_stat_.trajectory_done_flag = read_le<bool>(frame.data + 6);
             ctrl_pub_flag_ |= 0b0001;
             fresh_heartbeat_.notify_one();
+            break;
+        }
+        case CmdId::kTxSdo: {
+            if (!verify_length("kTxSdo", 8, frame.can_dlc)) break;
+            std::lock_guard<std::mutex> guard(ctrl_stat_mutex_);
+            //uint8_t  reserved0    = read_le<uint8_t>(frame.data + 0);
+            uint16_t endpoint_id = read_le<uint16_t>(frame.data + 1);
+            //uint8_t  reserved1    = read_le<uint8_t>(frame.data + 3);
+            uint32_t raw_val     = read_le<uint32_t>(frame.data + 4);
+
+            if(params_.get_type(endpoint_id) == typeid(bool).name()) {
+                bool val;
+                memcpy(&val, &raw_val, sizeof(bool));
+                params_.set_fresh<bool>(endpoint_id, val);
+                RCLCPP_INFO(rclcpp::Node::get_logger(), "recv_callback: node_id: %d, endpoint_id: %d,"
+                        " type: bool, value: %d", node_id_, endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(uint8_t).name()) {
+                uint8_t val;
+                memcpy(&val, &raw_val, sizeof(uint8_t));
+                RCLCPP_ERROR(rclcpp::Node::get_logger(), "recv_callback: uint8_t parameter is not currently supported");
+                //params_.set_fresh<uint8_t>(endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(uint16_t).name()) {
+                uint16_t val;
+                memcpy(&val, &raw_val, sizeof(uint16_t));
+                RCLCPP_ERROR(rclcpp::Node::get_logger(), "recv_callback: uint16_t parameter is not currently supported");
+                //params_.set_fresh<uint16_t>(endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(uint32_t).name()) {
+                uint32_t val;
+                memcpy(&val, &raw_val, sizeof(uint32_t));
+                RCLCPP_ERROR(rclcpp::Node::get_logger(), "recv_callback: uint32_t parameter is not currently supported");
+                //params_.set_fresh<uint32_t>(endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(uint64_t).name()) {
+                uint64_t val;
+                memcpy(&val, &raw_val, sizeof(uint64_t));
+                RCLCPP_ERROR(rclcpp::Node::get_logger(), "recv_callback: uint64_t parameter is not currently supported");
+                //params_.set_fresh<uint64_t>(endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(int32_t).name()) {
+                int32_t val;
+                memcpy(&val, &raw_val, sizeof(int32_t));
+                RCLCPP_ERROR(rclcpp::Node::get_logger(), "recv_callback: int32_t parameter is not currently supported");
+                //params_.set_fresh<int32_t>(endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(int64_t).name()) {
+                int64_t val;
+                memcpy(&val, &raw_val, sizeof(int64_t));
+                RCLCPP_ERROR(rclcpp::Node::get_logger(), "recv_callback: int64_t parameter is not currently supported");
+                //params_.set_fresh<int64_t>(endpoint_id, val);
+            } else if(params_.get_type(endpoint_id) == typeid(float).name()) {
+                float val;
+                memcpy(&val, &raw_val, sizeof(float));
+                params_.set_fresh<float>(endpoint_id, val);
+                RCLCPP_INFO(rclcpp::Node::get_logger(), "recv_callback: node_id: %d, endpoint_id: %d,"
+                        " type: float, value: %f", node_id_, endpoint_id, val);
+            } else {
+                // type does not exist
+                RCLCPP_ERROR(rclcpp::Node::get_logger(),
+                        "recv_callback: endpoint_id %d does not exist or callback "
+                        "process of the endpoint_id is not implemented", endpoint_id);
+            }
             break;
         }
         case CmdId::kGetError: {
@@ -318,4 +446,63 @@ inline bool ODriveCanNode::verify_length(const std::string&name, uint8_t expecte
     RCLCPP_DEBUG(rclcpp::Node::get_logger(), "received %s", name.c_str());
     if (!valid) RCLCPP_WARN(rclcpp::Node::get_logger(), "Incorrect %s frame length: %d != %d", name.c_str(), length, expected);
     return valid;
+}
+
+bool ODriveCanNode::is_gain_correct() {
+    float vel_gain_actual, vel_integrator_gain_actual;
+    get_arbitrary_parameter<float>(params_.get_id("axis0.controller.config.vel_gain"), vel_gain_actual);
+    get_arbitrary_parameter<float>(params_.get_id("axis0.controller.config.vel_integrator_gain"), vel_integrator_gain_actual);
+    bool is_vel_gain_correct = vel_gain_ == vel_gain_actual;
+    bool is_vel_integrator_gain_correct = vel_integrator_gain_ == vel_integrator_gain_actual;
+    return is_vel_gain_correct & is_vel_integrator_gain_correct;
+}
+
+template <typename T>
+void ODriveCanNode::get_arbitrary_parameter(uint16_t endpoint_id, T &output_val) {
+    // check existence
+    if(!params_.contains(endpoint_id)) {
+        RCLCPP_ERROR(rclcpp::Node::get_logger(), "endpoint id %d does not exist", endpoint_id);
+        return;
+    }
+    // check variable type
+    if(params_.get_type(endpoint_id) != typeid(T).name()) {
+        RCLCPP_ERROR(rclcpp::Node::get_logger(), "%hu is %s type, not %s", endpoint_id,
+                params_.get_type_demangled(endpoint_id).c_str(),
+                demangle(typeid(T).name()).c_str());
+        return;
+    }
+
+    // send can frame
+    struct can_frame frame;
+    frame.can_id = node_id_ << 5 | CmdId::kRxSdo;
+
+    uint8_t reserved = 0;
+    frame.can_dlc = 4;
+    {
+        write_le<uint8_t>(OpcodeId::kRead, frame.data + 0);
+        write_le<uint16_t>(endpoint_id,    frame.data + 1);
+        write_le<uint8_t>(reserved,        frame.data + 3);
+    }
+    can_intf_.send_can_frame(frame);
+
+    // receive can frame
+    params_.get_fresh<T>(endpoint_id, output_val);
+    return;
+}
+
+template <typename T>
+void ODriveCanNode::set_arbitrary_parameter(uint16_t endpoint_id, T val) {
+    struct can_frame frame;
+    for(int i=0; i<CAN_MAX_DLEN; i++) frame.data[i] = 0;
+
+    frame.can_id = node_id_ << 5 | CmdId::kRxSdo;
+
+    uint8_t reserved = 0;
+    frame.can_dlc = 4 + sizeof(T);
+
+    write_le<uint8_t>(OpcodeId::kWrite, frame.data + 0);
+    write_le<uint16_t>(endpoint_id,     frame.data + 1);
+    write_le<uint8_t>(reserved,         frame.data + 3);
+    write_le<T>(val,                    frame.data + 4);
+    can_intf_.send_can_frame(frame);
 }

@@ -25,6 +25,8 @@ include_directories(../odrive_base/include)
 add_executable(odrive_can_node 
   ../odrive_base/src/epoll_event_loop.cpp
   ../odrive_base/src/socket_can.cpp
+  src/arbitrary_parameter.cpp
+  src/demangle.cpp
   src/odrive_can_node.cpp
   src/main.cpp
   include/odrive_can_node.hpp)
@@ -41,7 +43,7 @@ install(
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY launch
+install(DIRECTORY launch json
   DESTINATION share/${PROJECT_NAME}
 )
 
