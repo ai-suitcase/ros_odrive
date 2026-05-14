@@ -59,7 +59,7 @@ ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_n
     std::string vel_gain_param_name = "vel_gain";
     rclcpp::Node::declare_parameter<double>(vel_gain_param_name, VEL_GAIN_DEFAULT);
     vel_gain_subscriber_ = std::make_shared<rclcpp::ParameterEventHandler>(this);
-    std::function<void(const rclcpp::Parameter&)> vel_gain_cb = 
+    std::function<void(const rclcpp::Parameter&)> vel_gain_cb =
         [this](const rclcpp::Parameter & p) {
             double vel_gain = p.as_double();
             this->vel_gain_ = vel_gain;
